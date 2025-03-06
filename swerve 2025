@@ -1,0 +1,227 @@
+import com.ctre.phoenix.motorcontrol.can.WPI_TalonFX;
+import com.ctre.phoenix.motorcontrol.ControlMode;
+import com.ctre.phoenix.sensors.CANCoder;
+import com.revrobotics.CANSparkMax;
+import com.revrobotics.CANSparkMaxLowLevel.MotorType;
+import com.revrobotics.SparkMaxPIDController;
+import com.revrobotics.CANEncoder;
+import com.revrobotics.ControlType;
+import edu.wpi.first.wpilibj.TimedRobot;
+import edu.wpi.first.wpilibj.GenericHID;
+import edu.wpi.first.wpilibj.XboxController;
+import edu.wpi.first.wpilibj.controller.PIDController;
+import edu.wpi.first.wpilibj.geometry.Translation2d;
+import edu.wpi.first.wpilibj.geometry.Rotation2d;
+import edu.wpi.first.wpilibj.kinematics.SwerveDriveKinematics;
+import edu.wpi.first.wpilibj.kinematics.SwerveDriveOdometry;
+import edu.wpi.first.wpilibj.kinematics.SwerveModuleState;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import edu.wpi.first.wpilibj2.command.CommandBase;
+import edu.wpi.first.wpilibj2.command.CommandScheduler;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+
+public class SwerveDriveRobot extends TimedRobot {
+
+    private SwerveModule frontLeft;
+    private SwerveModule frontRight;
+    private SwerveModule backLeft;
+    private SwerveModule backRight;
+    private SwerveDriveKinematics kinematics;
+    private SwerveDriveOdometry odometry;
+    private Elevator elevator;
+    private Shooter shooter;
+    private XboxController driverController;
+    private XboxController operatorController;
+
+    @Override
+    public void robotInit() {
+        frontLeft = new SwerveModule(1, 2, 0, 0.0);
+        frontRight = new SwerveModule(3, 4, 1, 0.0);
+        backLeft = new SwerveModule(5, 6, 2, 0.0);
+        backRight = new SwerveModule(7, 8, 3, 0.0);
+
+        kinematics = new SwerveDriveKinematics(
+            new Translation2d(0.381, 0.381),
+            new Translation2d(0.381, -0.381),
+            new Translation2d(-0.381, 0.381),
+            new Translation2d(-0.381, -0.381)
+        );
+
+        odometry = new SwerveDriveOdometry(kinematics, new Rotation2d(0));
+        
+        elevator = new Elevator(9, 10); // Assuming CAN IDs 9 and 10 for the elevator NEO motors
+        shooter = new Shooter(11); // Assuming CAN ID 11 for the shooter CIM motor
+
+        driverController = new XboxController(0);  // Drivetrain controller
+        operatorController = new XboxController(1);  // Elevator and shooter controller
+
+        // Register commands for elevator setpoints
+        CommandScheduler.getInstance().registerSubsystem(elevator);
+        CommandScheduler.getInstance().registerSubsystem(shooter);
+    }
+
+    @Override
+    public void teleopPeriodic() {
+        double xSpeed = -driverController.getY(GenericHID.Hand.kLeft); // Forward/backward
+        double ySpeed = driverController.getX(GenericHID.Hand.kLeft);  // Left/right
+        double rot = driverController.getX(GenericHID.Hand.kRight);    // Rotation
+
+        ChassisSpeeds chassisSpeeds = ChassisSpeeds.fromFieldRelativeSpeeds(xSpeed, ySpeed, rot, odometry.getPose().getRotation());
+        SwerveModuleState[] states = kinematics.toSwerveModuleStates(chassisSpeeds);
+
+        SwerveDriveKinematics.desaturateWheelSpeeds(states, maxSpeed);
+
+        frontLeft.setDesiredState(states[0]);
+        frontRight.setDesiredState(states[1]);
+        backLeft.setDesiredState(states[2]);
+        backRight.setDesiredState(states[3]);
+
+        odometry.update(Rotation2d.fromDegrees(gyro.getAngle()), states);
+
+        // Elevator setpoint control using buttons on the operator controller
+        if (operatorController.getAButton()) {
+            new MoveToSetpoint(elevator, Elevator.Setpoint.LOW).schedule();
+        } else if (operatorController.getBButton()) {
+            new MoveToSetpoint(elevator, Elevator.Setpoint.MID).schedule();
+        } else if (operatorController.getYButton()) {
+            new MoveToSetpoint(elevator, Elevator.Setpoint.HIGH).schedule();
+        }
+
+        // Manual elevator control using the left stick on the operator controller
+        double elevatorSpeed = operatorController.getY(GenericHID.Hand.kLeft);
+        elevator.setSpeed(elevatorSpeed);
+
+        // Shooter control using the right bumper on the operator controller
+        if (operatorController.getBumper(GenericHID.Hand.kRight)) {
+            shooter.runShooter();
+        } else {
+            shooter.stopShooter();
+        }
+    }
+
+    public static class SwerveModule extends SubsystemBase {
+        private final WPI_TalonFX driveMotor;
+        private final WPI_TalonFX steerMotor;
+        private final CANCoder encoder;
+        private final double zeroOffset;
+        private final PIDController pidController;
+
+        public SwerveModule(int driveMotorChannel, int steerMotorChannel, int encoderChannel, double zeroOffset) {
+            this.driveMotor = new WPI_TalonFX(driveMotorChannel, "CANivore");
+            this.steerMotor = new WPI_TalonFX(steerMotorChannel, "CANivore");
+            this.encoder = new CANCoder(encoderChannel, "CANivore");
+            this.zeroOffset = zeroOffset;
+            this.pidController = new PIDController(1.0, 0.0, 0.0);
+            this.pidController.enableContinuousInput(-Math.PI, Math.PI);
+        }
+
+        public void setDesiredState(SwerveModuleState state) {
+            double desiredAngle = state.angle.getRadians();
+            double currentAngle = Math.toRadians(encoder.getAbsolutePosition()) - zeroOffset;
+            double output = pidController.calculate(currentAngle, desiredAngle);
+            steerMotor.set(ControlMode.PercentOutput, output);
+            driveMotor.set(ControlMode.PercentOutput, state.speed);
+        }
+    }
+
+    public static class Elevator extends SubsystemBase {
+        private final CANSparkMax motor1;
+        private final CANSparkMax motor2;
+        private final SparkMaxPIDController pidController1;
+        private final SparkMaxPIDController pidController2;
+        private final CANEncoder encoder1;
+        private final CANEncoder encoder2;
+
+        public enum Setpoint {
+            LOW(0.0),
+            MID(1.0),
+            HIGH(2.0);
+
+            public final double position;
+
+            Setpoint(double position) {
+                this.position = position;
+            }
+        }
+
+        public Elevator(int motor1Channel, int motor2Channel) {
+            motor1 = new CANSparkMax(motor1Channel, MotorType.kBrushless);
+            motor2 = new CANSparkMax(motor2Channel, MotorType.kBrushless);
+
+            motor1.restoreFactoryDefaults();
+            motor2.restoreFactoryDefaults();
+            motor2.follow(motor1); // Set motor2 to follow motor1
+
+            pidController1 = motor1.getPIDController();
+            pidController2 = motor2.getPIDController();
+
+            encoder1 = motor1.getEncoder();
+            encoder2 = motor2.getEncoder();
+
+            pidController1.setP(0.1);
+            pidController1.setI(0.0);
+            pidController1.setD(0.0);
+            pidController1.setFF(0.0);
+
+            pidController2.setP(0.1);
+            pidController2.setI(0.0);
+            pidController2.setD(0.0);
+            pidController2.setFF(0.0);
+        }
+
+        public void setSpeed(double speed) {
+            motor1.set(speed);
+        }
+
+        public void moveToSetpoint(Setpoint setpoint) {
+            pidController1.setReference(setpoint.position, ControlType.kPosition);
+        }
+
+        public double getEncoderPosition() {
+            return encoder1.getPosition();
+        }
+    }
+
+    public static class Shooter extends SubsystemBase {
+        private final CANSparkMax motor;
+
+        public Shooter(int motorChannel) {
+            motor = new CANSparkMax(motorChannel, MotorType.kBrushed);
+            motor.restoreFactoryDefaults();
+        }
+
+        public void runShooter() {
+            motor.set(1.0); // Set the motor to full speed
+        }
+
+        public void stopShooter() {
+            motor.set(0.0); // Stop the motor
+        }
+    }
+
+    public static class MoveToSetpoint extends CommandBase {
+        private final Elevator elevator;
+        private final Elevator.Setpoint setpoint;
+
+        public MoveToSetpoint(Elevator elevator, Elevator.Setpoint setpoint) {
+            this.elevator = elevator;
+            this.setpoint = setpoint;
+            addRequirements(elevator);
+        }
+
+        @Override
+        public void initialize() {
+            elevator.moveToSetpoint(setpoint);
+        }
+
+        @Override
+        public boolean isFinished() {
+            // Command is finished when the elevator reaches the setpoint
+            return Math.abs(elevator.getEncoderPosition() - setpoint.position) < 0.05;
+        }
+    }
+
+    public static void main(String[] args) {
+        CommandScheduler.getInstance().run();
+    }
+}
